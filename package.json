@@ -1,0 +1,30 @@
+{
+  "name": "@klura/agent-claude-code",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Claude provider for the klura CLI agent — drives klura with the Claude Agent SDK, reusing your Claude Code authentication.",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "klura",
+    "agent",
+    "claude",
+    "anthropic"
+  ],
+  "license": "BUSL-1.1",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.92"
+  },
+  "peerDependencies": {
+    "@klura/runtime": "^0.3.0"
+  }
+}
