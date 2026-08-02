@@ -9,8 +9,18 @@
 // queries. Each `sdk.query()` runs until a terminal `result`; the outer loop
 // spawns a fresh `query({resume})` only when the agent ended a turn with text
 // and `onTurnEnd` returned a continuation.
+//
+// Two stop conditions cut a stream short before the model spends another
+// round: a terminal tool result the server hands back
+// (`takeTerminalToolResult`), and — under `failFastToolErrors` — the first
+// tool_result block flagged `is_error`. A stream failure is thrown with
+// `partialAgentResult` attached so the caller keeps both the crash reason and
+// the work done up to it.
 
 const path = require('path');
+
+/** Shortest gap between generating-turn heartbeats forwarded to the host. */
+const PROGRESS_HEARTBEAT_MS = 30_000;
 
 async function loadAgentSdk() {
   try {
@@ -77,17 +87,20 @@ function createProvider(config = {}) {
     defaultModel: 'claude-sonnet-4-6',
 
     async runAgent(opts) {
-      const sdk = await loadAgentSdk();
+      const sdk = await (config.loadAgentSdk || loadAgentSdk)();
       const { unwrapPersistedOutput } = loadAgentCore();
       const model = opts.model || config.model || 'claude-sonnet-4-6';
       const maxTurns = opts.maxRounds || 40;
       const emit = opts.emit || (() => {});
+      const failFastToolErrors =
+        opts.failFastToolErrors === true || config.failFastToolErrors === true;
 
       const steps = [];
       let sdkTurn = 0;
       let finalMessage = '';
       let terminationReason = null;
       let sdkResult = null;
+      let terminalToolResult = null;
 
       const baseOptions = {
         systemPrompt: opts.systemPrompt,
@@ -102,12 +115,18 @@ function createProvider(config = {}) {
         ],
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
+        // Partial-message events keep the harness's stall watchdog fed while a
+        // turn is still generating. Without them the stream is silent until a
+        // message completes, so a long authoring turn is indistinguishable
+        // from a dead one and gets killed mid-work.
+        includePartialMessages: true,
         mcpServers: {
           klura: { type: 'sdk', name: 'klura', instance: opts.server },
         },
       };
 
-      // Drain one sdk.query() stream to its terminal `result`.
+      // Drain one sdk.query() stream to its terminal `result`, or to the first
+      // stop condition — whichever comes first.
       async function runSingleQuery(promptInput, resumeSessionId) {
         const queryOptions = { ...baseOptions, maxTurns: Math.max(1, maxTurns - sdkTurn) };
         if (resumeSessionId) queryOptions.resume = resumeSessionId;
@@ -116,53 +135,95 @@ function createProvider(config = {}) {
         let lastAssistantText = null;
         let lastAssistantHadToolUse = false;
         let localResult = null;
-        let crash = null;
-        try {
-          for await (const msg of q) {
-            if (msg.type === 'result') {
-              localResult = msg;
-              continue;
+        let lastProgressAt = 0;
+        for await (const msg of q) {
+          // A partial event says the turn is still generating. Forward it as a
+          // rate-limited heartbeat so the harness's stall watchdog can tell a
+          // long authoring turn from a dead stream, without spamming the
+          // transcript with token-level noise.
+          if (msg.type === 'stream_event') {
+            const nowMs = Date.now();
+            if (nowMs - lastProgressAt >= PROGRESS_HEARTBEAT_MS) {
+              lastProgressAt = nowMs;
+              emit({ type: 'progress', detail: 'generating' });
             }
-            if (msg.type === 'assistant' && msg.message?.content) {
-              sdkTurn++;
-              lastAssistantText = null;
-              lastAssistantHadToolUse = false;
-              for (const block of msg.message.content) {
-                if (block.type === 'text' && block.text?.trim()) {
-                  const text = block.text.trim();
-                  steps.push({ type: 'text', content: text });
-                  emit({ type: 'text', text });
-                  lastAssistantText = text;
-                }
-                if (block.type === 'tool_use') {
-                  lastAssistantHadToolUse = true;
-                  const toolName = block.name.replace(/^mcp__klura__/, '');
-                  steps.push({ type: 'tool_call', tool: toolName, args: block.input || {}, toolUseId: block.id });
-                  emit({ type: 'tool_call', tool: toolName, args: block.input || {} });
-                }
+            continue;
+          }
+          if (msg.type === 'result') {
+            localResult = msg;
+            continue;
+          }
+          if (msg.type === 'assistant' && msg.message?.content) {
+            sdkTurn++;
+            lastAssistantText = null;
+            lastAssistantHadToolUse = false;
+            for (const block of msg.message.content) {
+              if (block.type === 'text' && block.text?.trim()) {
+                const text = block.text.trim();
+                steps.push({ type: 'text', content: text });
+                emit({ type: 'text', text });
+                lastAssistantText = text;
               }
-            }
-            if (msg.type === 'user' && msg.message?.content) {
-              for (const block of msg.message.content) {
-                if (block.type !== 'tool_result') continue;
-                const call = steps.findLast(
-                  (s) => s.type === 'tool_call' && s.toolUseId === block.tool_use_id,
-                );
-                const toolName = call?.tool ?? 'unknown';
-                const { result, obligationText } = parseToolResult(block.content, unwrapPersistedOutput);
-                steps.push({ type: 'tool_result', tool: toolName, result });
-                emit({ type: 'tool_result', tool: toolName, result, obligationText });
+              if (block.type === 'tool_use') {
+                lastAssistantHadToolUse = true;
+                const toolName = block.name.replace(/^mcp__klura__/, '');
+                steps.push({
+                  type: 'tool_call',
+                  tool: toolName,
+                  args: block.input || {},
+                  toolUseId: block.id,
+                });
+                emit({ type: 'tool_call', tool: toolName, args: block.input || {} });
               }
             }
           }
-        } catch (err) {
-          crash = err && err.message ? err.message : String(err);
+          if (msg.type === 'user' && msg.message?.content) {
+            for (const block of msg.message.content) {
+              if (block.type !== 'tool_result') continue;
+              const call = steps.findLast(
+                (s) => s.type === 'tool_call' && s.toolUseId === block.tool_use_id,
+              );
+              const toolName = call?.tool ?? 'unknown';
+              const { result, obligationText } = parseToolResult(
+                block.content,
+                unwrapPersistedOutput,
+              );
+              steps.push({
+                type: 'tool_result',
+                tool: toolName,
+                result,
+                toolUseId: block.tool_use_id,
+              });
+              emit({ type: 'tool_result', tool: toolName, result, obligationText });
+              const terminal =
+                typeof opts.server?.takeTerminalToolResult === 'function'
+                  ? opts.server.takeTerminalToolResult()
+                  : null;
+              if (terminal) {
+                terminalToolResult = terminal;
+                break;
+              }
+              if (failFastToolErrors && block.is_error === true) {
+                terminalToolResult = {
+                  terminate: true,
+                  kind: 'actor_tool_error',
+                  code: 'actor_tool_error',
+                  source: `tool_result:${toolName}`,
+                  tool: toolName,
+                  reason: 'mcp_error_result',
+                };
+                break;
+              }
+            }
+            // Breaking the stream returns the SDK generator, which tears the
+            // query down; nothing else is drained after a terminal result.
+            if (terminalToolResult) break;
+          }
         }
         return {
           sessionId: localResult?.session_id || null,
           subtype: localResult?.subtype || null,
           sdkResult: localResult,
-          crash,
           lastAssistantText,
           lastAssistantHadToolUse,
         };
@@ -170,38 +231,58 @@ function createProvider(config = {}) {
 
       let nextPrompt = opts.goal;
       let resumeSessionId = null;
-      for (;;) {
-        const step = await runSingleQuery(nextPrompt, resumeSessionId);
-        if (step.sdkResult) sdkResult = step.sdkResult;
-        if (step.crash) {
-          terminationReason = 'crash';
-          break;
+      try {
+        for (;;) {
+          const step = await runSingleQuery(nextPrompt, resumeSessionId);
+          if (step.sdkResult) sdkResult = step.sdkResult;
+          if (terminalToolResult) {
+            terminationReason =
+              typeof terminalToolResult.code === 'string'
+                ? terminalToolResult.code
+                : 'terminal_tool_result';
+            break;
+          }
+          if (step.subtype && step.subtype !== 'success') {
+            terminationReason = step.subtype;
+            break;
+          }
+          if (sdkTurn >= maxTurns) {
+            terminationReason = 'max_turns';
+            break;
+          }
+          // Turn ended mid-tool or with no text — nothing to hand to onTurnEnd.
+          if (!step.lastAssistantText || step.lastAssistantHadToolUse) {
+            terminationReason = 'no_text_tail';
+            break;
+          }
+          finalMessage = step.lastAssistantText;
+          const reply = await opts.onTurnEnd(step.lastAssistantText, { steps, rounds: sdkTurn });
+          if (reply === null || reply === undefined) {
+            terminationReason = 'turn_ended';
+            break;
+          }
+          if (!step.sessionId) {
+            terminationReason = 'no_session_to_resume';
+            break;
+          }
+          nextPrompt = String(reply);
+          resumeSessionId = step.sessionId;
         }
-        if (step.subtype && step.subtype !== 'success') {
-          terminationReason = step.subtype;
-          break;
+      } catch (error) {
+        // The caller reads the crash reason and its `code` off this error; the
+        // partial result carries the work the run already produced.
+        if (error && typeof error === 'object') {
+          error.partialAgentResult = {
+            finalMessage,
+            steps,
+            usage: sdkResult?.usage || null,
+            rounds: sdkTurn,
+            terminationReason: 'crash',
+            model,
+            terminalToolResult,
+          };
         }
-        if (sdkTurn >= maxTurns) {
-          terminationReason = 'max_turns';
-          break;
-        }
-        // Turn ended mid-tool or with no text — nothing to hand to onTurnEnd.
-        if (!step.lastAssistantText || step.lastAssistantHadToolUse) {
-          terminationReason = 'no_text_tail';
-          break;
-        }
-        finalMessage = step.lastAssistantText;
-        const reply = await opts.onTurnEnd(step.lastAssistantText, { steps });
-        if (reply === null || reply === undefined) {
-          terminationReason = 'turn_ended';
-          break;
-        }
-        if (!step.sessionId) {
-          terminationReason = 'no_session_to_resume';
-          break;
-        }
-        nextPrompt = String(reply);
-        resumeSessionId = step.sessionId;
+        throw error;
       }
 
       return {
@@ -210,6 +291,8 @@ function createProvider(config = {}) {
         usage: sdkResult?.usage || null,
         rounds: sdkTurn,
         terminationReason: terminationReason || 'done',
+        model,
+        terminalToolResult,
       };
     },
   };
