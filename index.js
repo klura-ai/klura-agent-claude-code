@@ -108,10 +108,24 @@ function createProvider(config = {}) {
         settingSources: [],
         strictMcpConfig: true,
         allowedTools: ['mcp__klura__*', 'ListMcpResourcesTool', 'ReadMcpResourceTool'],
+        // Everything the host offers that is not klura. Two families matter
+        // beyond the obvious filesystem and network tools:
+        //
+        //   The subagent tools (`Task` is the name the SDK exposes, `Agent` an
+        //   alias) would hand work the session must do itself to another agent
+        //   whose steps the session never sees.
+        //
+        //   The scheduling tools let a turn defer itself instead of finishing:
+        //   a worker that waits on a wake-up ends its turn having saved
+        //   nothing, and the session expires before the wake-up fires.
         disallowedTools: [
-          'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Agent', 'TodoRead',
+          'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'TodoRead',
           'TodoWrite', 'WebFetch', 'WebSearch', 'NotebookEdit', 'LSP', 'Skill',
           'AskFollowupQuestion', 'AskUserQuestion', 'ToolSearch',
+          'Agent', 'Task', 'TaskOutput', 'TaskStop',
+          'CronCreate', 'CronList', 'CronDelete', 'ScheduleWakeup', 'Monitor',
+          'PushNotification', 'SendMessage', 'ListAgents',
+          'EnterPlanMode', 'ExitPlanMode',
         ],
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
